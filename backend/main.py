@@ -1,0 +1,1371 @@
+import os
+import json
+import base64
+import asyncio
+import websockets
+import uuid
+import time
+import io
+import traceback
+import hashlib
+from pathlib import Path
+from fastapi import FastAPI, WebSocket, Request, HTTPException, Depends
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.websockets import WebSocketDisconnect
+from datetime import datetime as dt, timedelta, timezone
+import jwt
+from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream, Parameter
+from dotenv import load_dotenv
+from pydub import AudioSegment
+import audioop
+from contextlib import suppress
+import httpx
+
+from backend.services.prompts import build_system_message
+from backend.logger.call_log_apis import *
+from backend.services.prompts import function_call_tools
+from backend.services.rag_tools import search_knowledge_base, prewarm_embeddings
+from backend.services.language_detector import detect_language
+from backend.services.audio_transcription import transcribe_audio, analyze_call_with_llm
+from backend.services.gemini_live import (
+    GeminiLiveClient,
+    GeminiLiveConfig,
+    GeminiResponse,
+    GEMINI_RECEIVE_SAMPLE_RATE,
+    GEMINI_VOICES,
+)
+from backend.utils.audio_utils import (
+    convert_browser_to_gemini,
+    convert_gemini_to_browser,
+    reset_audio_states,
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+STATIC_DIR = REPO_ROOT / "frontend" / "static"
+RECORDINGS_DIR = REPO_ROOT / "recordings"
+
+
+class TokenTracker:
+    """
+    Estimates token usage per turn and cumulative for a Gemini Live API call.
+
+    Gemini Live API does not expose usage_metadata, so we estimate from
+    observable data: audio duration, transcription text, tool payloads,
+    and the system prompt.
+
+    Rates (from Google docs / empirical):
+      - Audio input:  ~25 tokens/sec at 16 kHz mono 16-bit PCM
+      - Audio output: ~25 tokens/sec at 24 kHz mono 16-bit PCM
+      - Text:         ~1 token per 4 characters (mixed EN/UR average)
+      - JSON payload: ~1 token per 4 characters
+    """
+
+    AUDIO_INPUT_TOKENS_PER_SEC = 25      # 16 kHz, 16-bit mono
+    AUDIO_OUTPUT_TOKENS_PER_SEC = 25     # 24 kHz, 16-bit mono
+    CHARS_PER_TOKEN = 4
+    CONTEXT_WINDOW = 8192                # matches sliding_window target_tokens
+
+    def __init__(self, call_id: str, system_prompt: str, tools_json: list):
+        self.call_id = call_id
+        self.turn_number = 0
+
+        # One-time system cost
+        tools_text = json.dumps(tools_json)
+        self.system_prompt_tokens = len(system_prompt) // self.CHARS_PER_TOKEN
+        self.tools_tokens = len(tools_text) // self.CHARS_PER_TOKEN
+        self.base_tokens = self.system_prompt_tokens + self.tools_tokens
+
+        # Per-turn accumulators (reset each turn)
+        self._turn_input_audio_bytes = 0
+        self._turn_output_audio_bytes = 0
+        self._turn_input_text = ""
+        self._turn_output_text = ""
+        self._turn_tool_calls: list[dict] = []
+
+        # Cumulative totals
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_tool_tokens = 0
+        self.total_turns = 0
+
+        # Per-turn history for post-call dump
+        self.turn_history: list[dict] = []
+
+        print(
+            f"🔢 [TOKENS] call={call_id} session_init | "
+            f"system_prompt: ~{self.system_prompt_tokens} | "
+            f"tools: ~{self.tools_tokens} | "
+            f"base_context: ~{self.base_tokens} / {self.CONTEXT_WINDOW}"
+        )
+
+    # -- Accumulate events within a turn --
+
+    def add_input_audio(self, pcm_bytes: int) -> None:
+        self._turn_input_audio_bytes += pcm_bytes
+
+    def add_output_audio(self, pcm_bytes: int) -> None:
+        self._turn_output_audio_bytes += pcm_bytes
+
+    def set_input_transcription(self, text: str) -> None:
+        self._turn_input_text = text
+
+    def set_output_transcription(self, text: str) -> None:
+        self._turn_output_text = text
+
+    def add_tool_call(self, func_name: str, args: dict, result: dict) -> None:
+        args_text = json.dumps(args)
+        result_text = json.dumps(result)
+        tokens = (len(args_text) + len(result_text)) // self.CHARS_PER_TOKEN
+        self._turn_tool_calls.append({
+            "function": func_name,
+            "args_tokens": len(args_text) // self.CHARS_PER_TOKEN,
+            "result_tokens": len(result_text) // self.CHARS_PER_TOKEN,
+            "total_tokens": tokens,
+        })
+
+    # -- Audio duration helpers --
+
+    def _audio_seconds(self, pcm_bytes: int, sample_rate: int) -> float:
+        # 16-bit mono = 2 bytes per sample
+        return pcm_bytes / (sample_rate * 2) if pcm_bytes else 0.0
+
+    # -- Finalize a turn --
+
+    def finalize_turn(self) -> dict:
+        self.turn_number += 1
+        self.total_turns += 1
+
+        input_audio_sec = self._audio_seconds(self._turn_input_audio_bytes, 16000)
+        output_audio_sec = self._audio_seconds(self._turn_output_audio_bytes, 24000)
+
+        input_audio_tokens = int(input_audio_sec * self.AUDIO_INPUT_TOKENS_PER_SEC)
+        output_audio_tokens = int(output_audio_sec * self.AUDIO_OUTPUT_TOKENS_PER_SEC)
+        input_text_tokens = len(self._turn_input_text) // self.CHARS_PER_TOKEN
+        output_text_tokens = len(self._turn_output_text) // self.CHARS_PER_TOKEN
+
+        turn_input = input_audio_tokens + input_text_tokens
+        turn_output = output_audio_tokens + output_text_tokens
+        turn_tool = sum(tc["total_tokens"] for tc in self._turn_tool_calls)
+
+        self.total_input_tokens += turn_input
+        self.total_output_tokens += turn_output
+        self.total_tool_tokens += turn_tool
+
+        cumulative = self.base_tokens + self.total_input_tokens + self.total_output_tokens + self.total_tool_tokens
+        utilization = (cumulative / self.CONTEXT_WINDOW * 100) if self.CONTEXT_WINDOW else 0
+
+        turn_data = {
+            "turn": self.turn_number,
+            "input": {
+                "audio_sec": round(input_audio_sec, 2),
+                "audio_tokens": input_audio_tokens,
+                "text_tokens": input_text_tokens,
+                "total": turn_input,
+            },
+            "output": {
+                "audio_sec": round(output_audio_sec, 2),
+                "audio_tokens": output_audio_tokens,
+                "text_tokens": output_text_tokens,
+                "total": turn_output,
+            },
+            "tool_calls": self._turn_tool_calls.copy(),
+            "tool_tokens": turn_tool,
+            "turn_total": turn_input + turn_output + turn_tool,
+            "cumulative": {
+                "input": self.total_input_tokens,
+                "output": self.total_output_tokens,
+                "tools": self.total_tool_tokens,
+                "base": self.base_tokens,
+                "total": cumulative,
+                "context_window": self.CONTEXT_WINDOW,
+                "utilization_pct": round(utilization, 1),
+            },
+        }
+
+        self.turn_history.append(turn_data)
+
+        # Build tool line
+        tool_line = ""
+        if self._turn_tool_calls:
+            tool_names = ", ".join(tc["function"] for tc in self._turn_tool_calls)
+            tool_line = f"\n   tool: ~{turn_tool} tokens ({tool_names})"
+
+        print(
+            f"🔢 [TOKENS] call={self.call_id} turn={self.turn_number}\n"
+            f"   input: ~{turn_input} tokens (audio: ~{input_audio_tokens} [{input_audio_sec:.1f}s], text: ~{input_text_tokens})\n"
+            f"   output: ~{turn_output} tokens (audio: ~{output_audio_tokens} [{output_audio_sec:.1f}s], text: ~{output_text_tokens})"
+            f"{tool_line}\n"
+            f"   turn_total: ~{turn_data['turn_total']} | cumulative: ~{cumulative} / {self.CONTEXT_WINDOW} ({utilization:.0f}%)"
+        )
+
+        # Reset per-turn accumulators
+        self._turn_input_audio_bytes = 0
+        self._turn_output_audio_bytes = 0
+        self._turn_input_text = ""
+        self._turn_output_text = ""
+        self._turn_tool_calls = []
+
+        return turn_data
+
+    def get_summary(self) -> dict:
+        cumulative = self.base_tokens + self.total_input_tokens + self.total_output_tokens + self.total_tool_tokens
+        return {
+            "call_id": self.call_id,
+            "total_turns": self.total_turns,
+            "base_tokens": self.base_tokens,
+            "system_prompt_tokens": self.system_prompt_tokens,
+            "tools_tokens": self.tools_tokens,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tool_tokens": self.total_tool_tokens,
+            "total_tokens": cumulative,
+            "context_window": self.CONTEXT_WINDOW,
+            "utilization_pct": round(cumulative / self.CONTEXT_WINDOW * 100, 1) if self.CONTEXT_WINDOW else 0,
+            "turn_history": self.turn_history,
+        }
+
+load_dotenv(override=True)
+
+PORT = 7033  # HugoBank call center
+API_KEY = "Synergates@123"  # Reusable API key for external clients
+
+VOICE = 'echo'
+
+LOG_EVENT_TYPES = [
+    'response.content.done', 'input_audio_buffer.committed',
+    'session.created', 'conversation.item.deleted', 'conversation.item.created'
+]
+
+WARNING_EVENT_TYPES = [
+    'error', 'rate_limits.updated'
+]
+
+SHOW_TIMING_MATH = False
+call_recordings = {}
+
+app = FastAPI()
+
+
+@app.on_event("startup")
+async def startup_prewarm():
+    asyncio.create_task(prewarm_embeddings())
+
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "hugobank-ai-call-center-secret-key-2024")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
+
+USERS_DB = {
+    "admin": {
+        "username": "admin",
+        "password": "admin1234",
+        "full_name": "Administrator"
+    },
+    "demo": {
+        "username": "demouser",
+        "password": "demouser1234",
+        "full_name": "Demo User"
+    },
+    "hugobank": {
+        "username": "hugobank",
+        "password": "hugobank1234",
+        "full_name": "HugoBank Team"
+    }
+}
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/client", StaticFiles(directory=str(STATIC_DIR), html=True), name="client")
+
+CHANNELS = 1
+RATE = 8000
+
+call_metadata: dict[str, dict] = {}
+
+
+def _init_conversation_state(call_id: str) -> None:
+    call_metadata.setdefault(call_id, {})
+    call_metadata[call_id].setdefault("conversation_memory", [])
+    call_metadata[call_id].setdefault("question_queue", [])
+    call_metadata[call_id].setdefault("answered_questions", [])
+    call_metadata[call_id].setdefault("conversation_summary", "")
+
+
+def _log_conversation_state(call_id: str, operation: str) -> None:
+    state = call_metadata.get(call_id, {})
+    pending = state.get("question_queue", [])
+    answered = state.get("answered_questions", [])
+    topics = state.get("conversation_memory", [])
+    summary = state.get("conversation_summary", "")
+    print(f"📝 [CONV STATE] call={call_id} op={operation}")
+    print(f"   pending_questions ({len(pending)}): {[q.get('question', '') for q in pending]}")
+    print(f"   answered_questions ({len(answered)}): {[q.get('question', '') for q in answered]}")
+    print(f"   topics ({len(topics)}): {topics}")
+    print(f"   summary: {summary[:120]}{'...' if len(summary) > 120 else ''}")
+
+
+def _is_duplicate_question(existing_questions: list, new_question: str) -> bool:
+    new_lower = new_question.lower()
+    new_words = set(new_lower.split())
+    for item in existing_questions:
+        existing_lower = str(item.get("question", "")).strip().lower()
+        if existing_lower == new_lower:
+            return True
+        if existing_lower in new_lower or new_lower in existing_lower:
+            return True
+        existing_words = set(existing_lower.split())
+        if not new_words or not existing_words:
+            continue
+        overlap = len(new_words & existing_words) / max(len(new_words), len(existing_words))
+        if overlap >= 0.7:
+            return True
+    return False
+
+
+def _fuzzy_match_question(pending_text: str, answered_text: str) -> bool:
+    p = pending_text.lower()
+    a = answered_text.lower()
+    if p == a:
+        return True
+    if p in a or a in p:
+        return True
+    p_words = set(p.split())
+    a_words = set(a.split())
+    if not p_words or not a_words:
+        return False
+    overlap = len(p_words & a_words) / max(len(p_words), len(a_words))
+    return overlap >= 0.6
+
+
+def _update_conversation_state(call_id: str, operation: str, payload: dict) -> dict:
+    _init_conversation_state(call_id)
+    state = call_metadata[call_id]
+    payload = payload or {}
+
+    if operation == "get_state":
+        _log_conversation_state(call_id, "get_state")
+        return {"success": True, "message": "Current conversation state retrieved."}
+
+    if operation == "add_pending_questions":
+        questions = payload.get("questions", [])
+        if not isinstance(questions, list):
+            return {"success": False, "error": "Invalid payload", "message": "questions must be a list."}
+        added = []
+        skipped = []
+        for q in questions:
+            if isinstance(q, str) and q.strip():
+                q_clean = q.strip()
+                if _is_duplicate_question(state["question_queue"], q_clean):
+                    skipped.append(q_clean)
+                else:
+                    state["question_queue"].append({"question": q_clean, "status": "pending"})
+                    added.append(q_clean)
+        _log_conversation_state(call_id, "add_pending_questions")
+        return {
+            "success": True,
+            "added": added,
+            "skipped_duplicates": skipped,
+            "message": f"Added {len(added)} question(s), skipped {len(skipped)} duplicate(s).",
+        }
+
+    if operation == "mark_answered":
+        answered = payload.get("answered_questions", [])
+        if not isinstance(answered, list):
+            return {"success": False, "error": "Invalid payload", "message": "answered_questions must be a list."}
+        matched = []
+        remaining = []
+        for item in state["question_queue"]:
+            q_text = str(item.get("question", "")).strip()
+            found = False
+            for a in answered:
+                if isinstance(a, str) and a.strip() and _fuzzy_match_question(q_text, a.strip()):
+                    state["answered_questions"].append({"question": q_text, "status": "answered"})
+                    matched.append(q_text)
+                    found = True
+                    break
+            if not found:
+                remaining.append(item)
+        state["question_queue"] = remaining
+        _log_conversation_state(call_id, "mark_answered")
+        return {
+            "success": True,
+            "matched": matched,
+            "still_pending": [q.get("question", "") for q in remaining],
+            "message": f"Marked {len(matched)} question(s) as answered. {len(remaining)} still pending.",
+        }
+
+    if operation == "set_summary":
+        summary = str(payload.get("summary", "")).strip()
+        topics = payload.get("topics_discussed", [])
+        state["conversation_summary"] = summary
+        if isinstance(topics, list):
+            existing_lower = {t.lower() for t in state["conversation_memory"]}
+            for topic in topics:
+                if isinstance(topic, str) and topic.strip() and topic.strip().lower() not in existing_lower:
+                    state["conversation_memory"].append(topic.strip())
+                    existing_lower.add(topic.strip().lower())
+        _log_conversation_state(call_id, "set_summary")
+        return {"success": True, "message": "Conversation summary updated."}
+
+    return {"success": False, "error": "Unknown operation", "message": f"Unsupported operation: {operation}"}
+
+@app.get("/", response_class=HTMLResponse)
+async def index_page():
+    with open(STATIC_DIR / "voice-client.html", "r", encoding="utf-8") as f:
+        html_content = f.read()
+    return html_content
+
+from fastapi import Body
+
+# Convert Gemini voices to UI format
+AVAILABLE_VOICES = {
+    voice_key: {
+        'name': voice_data['name'],
+        'age': voice_data['gender'],
+        'personality': voice_data['description']
+    }
+    for voice_key, voice_data in GEMINI_VOICES.items()
+}
+
+
+@app.post("/start-browser-call")
+async def start_browser_call(request: Request, payload: dict = Body(...)):
+    user_data = authenticate_request(request)
+
+    session_id = payload.get("sessionId")
+    interaction_id = payload.get("interactionId")
+    reference_id = payload.get("referenceId")
+
+    if not session_id or not interaction_id or not reference_id:
+        raise HTTPException(
+            status_code=400,
+            detail="sessionId, interactionId, and referenceId are required",
+        )
+
+    try:
+        session_id = str(uuid.UUID(str(session_id)))
+        interaction_id = str(uuid.UUID(str(interaction_id)))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="sessionId and interactionId must be valid UUIDs",
+        )
+
+    reference_id = str(reference_id)
+
+    phone = payload.get("phone", "webclient")
+    voice = payload.get("voice", "Charon")  # Default to Charon (Gemini's deep, informative voice)
+    temperature = payload.get("temperature", 0.8)
+    speed = payload.get("speed", 1.05)
+
+    # Validate voice is available in Gemini voices
+    if voice not in AVAILABLE_VOICES:
+        voice = "Charon"
+
+    temperature = max(0.0, min(1.2, float(temperature)))
+    speed = max(0.5, min(2.0, float(speed)))
+
+    print(f"🎙️ Voice selected: {voice} ({AVAILABLE_VOICES[voice]['name']})")
+    print(f"🌡️ Temperature: {temperature}")
+    print(f"⚡ Speed: {speed}x")
+
+    call_id = await register_call(phone)
+    call_id = str(call_id)
+    call_recordings[call_id] = {"incoming": [], "outgoing": [], "start_time": time.time()}
+    call_metadata[call_id] = {
+        "phone": phone,
+        "language_id": payload.get("language_id", 1),
+        "voice": voice,
+        "temperature": temperature,
+        "speed": speed,
+        "auth_identity": user_data["username"],
+        "auth_method": user_data.get("auth_method", "jwt"),
+        "session_id": session_id,
+        "interaction_id": interaction_id,
+        "reference_id": reference_id,
+    }
+    _init_conversation_state(call_id)
+    await update_call_status(int(call_id), "pick")
+    return {
+        "call_id": call_id,
+        "voice": voice,
+        "temperature": temperature,
+        "speed": speed,
+        "sessionId": session_id,
+        "interactionId": interaction_id,
+        "referenceId": reference_id,
+    }
+
+
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    form = await request.form()
+    caller_number = form.get("From")
+    print("Call is coming from", caller_number)  
+    call_id = await register_call(caller_number)
+    call_id = str(call_id)
+    print("call id received is", call_id, type(call_id))
+
+    call_recordings[call_id] = {"incoming": [], "outgoing": [], "start_time": time.time()}
+    
+    call_metadata[call_id] = {
+        "phone": caller_number, 
+        "language_id": 1,
+        "voice": "echo",
+        "temperature": 0.8,
+        "speed": 1.05
+    }
+    _init_conversation_state(call_id)
+    
+    response = VoiceResponse()
+    response.say("This call may be recorded for quality purposes.", voice='Polly.Danielle-Generative', language='en-US')
+    response.pause(length=1)
+    host = request.url.hostname
+
+    connect = Connect()
+    stream = Stream(url=f"wss://{host}/media-stream")
+    stream.parameter(name="call_id", value=call_id)
+    connect.append(stream)
+    response.append(connect)
+
+    return HTMLResponse(content=str(response), media_type="application/xml")
+
+    
+
+import wave
+import audioop
+import io
+import base64
+import websockets as ws_client
+from fastapi import WebSocket
+
+USER_AUDIO_DIR = RECORDINGS_DIR / "user"
+AGENT_AUDIO_DIR = RECORDINGS_DIR / "agent"
+USER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+AGENT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+import struct
+import wave
+import struct
+
+
+last_agent_response_time = None
+
+def generate_silence(duration_sec, sample_rate=8000):
+    num_samples = int(duration_sec * sample_rate)
+    silence_pcm = b'\x00\x00' * num_samples
+    return silence_pcm
+
+
+async def execute_function_call(func_name: str, func_args: dict, call_id: str | None = None) -> dict:
+    try:
+        if func_name == "updateConversationState":
+            if not call_id:
+                return {
+                    "success": False,
+                    "error": "Missing call_id",
+                    "message": "Cannot update conversation state without call context.",
+                }
+            operation = str(func_args.get("operation", "")).strip()
+            payload = func_args.get("payload", {})
+            update_result = _update_conversation_state(call_id, operation, payload)
+            state = call_metadata.get(call_id, {})
+            return {
+                **update_result,
+                "state": {
+                    "conversation_summary": state.get("conversation_summary", ""),
+                    "topics_discussed": state.get("conversation_memory", []),
+                    "pending_questions": state.get("question_queue", []),
+                    "answered_questions": state.get("answered_questions", []),
+                },
+            }
+
+        result: dict
+        if func_name == "setResponseLanguage":
+            declared = str(func_args.get("language", "")).strip().lower()
+            evidence = str(func_args.get("evidence", "")).strip()
+            valid_langs = {"en", "ur", "pa", "ps", "sd"}
+            if declared not in valid_langs:
+                return {
+                    "success": False,
+                    "error": "invalid_language",
+                    "message": f"language must be one of {sorted(valid_langs)}",
+                }
+
+            final_lang = declared
+            corrected = False
+            backend_lang: str | None = None
+            conf: float = 0.0
+            scores: dict[str, int] = {}
+            ambiguous_first_turn = False
+
+            if call_id and call_id in call_metadata:
+                meta = call_metadata[call_id]
+                turn_text = meta.get("_current_user_turn_text", "")
+                if turn_text:
+                    backend_lang, conf, scores = detect_language(turn_text)
+
+                locked = meta.get("language_lock")
+                if locked and locked != declared:
+                    if backend_lang == declared and scores.get(declared, 0) >= 2:
+                        pass
+                    elif backend_lang == locked or backend_lang is None:
+                        final_lang = locked
+                        corrected = True
+
+                if backend_lang and backend_lang != final_lang and conf >= 0.6:
+                    print(
+                        f"⚠️ [LANG-MISMATCH] call={call_id} gemini={declared} "
+                        f"backend={backend_lang} conf={conf:.2f} scores={scores} "
+                        f"→ corrected={backend_lang}"
+                    )
+                    final_lang = backend_lang
+                    corrected = True
+
+                history = meta.setdefault("language_history", [])
+                if backend_lang is None and not history and not meta.get("language_lock"):
+                    ambiguous_first_turn = True
+
+                meta["last_declared_language"] = final_lang
+                history.append({
+                    "gemini": declared,
+                    "backend": backend_lang,
+                    "conf": conf,
+                    "final": final_lang,
+                    "evidence": evidence,
+                    "ts": time.time(),
+                })
+
+                if backend_lang == declared and backend_lang is not None:
+                    meta["_lang_agree_streak"] = meta.get("_lang_agree_streak", 0) + 1
+                    if meta["_lang_agree_streak"] >= 2:
+                        meta["language_lock"] = final_lang
+                else:
+                    meta["_lang_agree_streak"] = 0
+
+                meta["_current_user_turn_text"] = ""
+
+            print(
+                f"🌐 [LANG] call={call_id} final={final_lang} "
+                f"(gemini={declared}, backend={backend_lang}, conf={conf:.2f}, corrected={corrected})"
+            )
+
+            if ambiguous_first_turn:
+                return {
+                    "success": True,
+                    "language": final_lang,
+                    "ambiguous": True,
+                    "hint": (
+                        "The caller's first turn could not be classified into any of the 5 "
+                        "supported languages. Reply in Urdu and ask EXACTLY ONCE which language "
+                        "they prefer: English, Urdu, Punjabi, Pashto, or Sindhi."
+                    ),
+                }
+            if corrected:
+                return {
+                    "success": True,
+                    "language": final_lang,
+                    "corrected": True,
+                    "hint": (
+                        f"Override: backend classifier identified the caller as speaking "
+                        f"{final_lang}, not {declared}. Speak the entire reply in {final_lang}."
+                    ),
+                }
+            return {"success": True, "language": final_lang}
+
+        if func_name == "searchKnowledgeBase":
+            result = await search_knowledge_base(query=func_args.get("query", ""))
+
+        else:
+            result = {
+                "success": False,
+                "error": f"Unknown function: {func_name}",
+                "message": "Function not found in the system."
+            }
+
+        return result
+    
+    except Exception as e:
+        print(f"❌ Error executing function {func_name}: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"An error occurred while executing {func_name}."
+        }
+
+@app.websocket("/media-stream-browser")
+async def media_stream_browser(websocket: WebSocket):
+    """
+    WebSocket endpoint for browser-based voice calls using Gemini Live API.
+    
+    Handles:
+    - Browser audio streaming (8kHz PCM) -> Gemini (16kHz PCM)
+    - Gemini responses (24kHz PCM) -> Browser (8kHz PCM)
+    - Function calling for RAG and customer verification
+    """
+    await websocket.accept()
+    
+    session_initialized = False
+    call_id = None
+    stream_sid = None
+    gemini_client = None
+    cleanup_done = False
+
+    user_pcm_buffer = io.BytesIO()
+    agent_pcm_buffer = io.BytesIO()
+
+    function_call_completed_time = None
+    FUNCTION_CALL_GRACE_PERIOD = 0.5
+
+    _tool_call_received_at = None
+    _tool_func_name = None
+    _tool_response_sent_at = None
+    _first_audio_after_tool = True
+    _audio_sent_before_tool = False  # True if audio was already forwarded before a tool call in this turn
+    _suppress_post_tool_audio = False  # True = drop all post-tool audio until turn_complete
+    _turn_audio_bytes = 0  # Track audio bytes sent to browser in current turn
+    _post_tool_watchdog_task: asyncio.Task | None = None
+    POST_TOOL_AUDIO_TIMEOUT_SECONDS = float(os.getenv("POST_TOOL_AUDIO_TIMEOUT_SECONDS", "2.0"))
+
+    # User-idle watchdog state: nudge the customer if they go quiet for too long.
+    _last_user_speech_at = time.time()
+    _agent_is_speaking = False
+    _idle_checkin_count = 0
+    USER_IDLE_TIMEOUT_SECONDS = float(os.getenv("USER_IDLE_TIMEOUT_SECONDS", "15.0"))
+    MAX_IDLE_CHECKINS = int(os.getenv("MAX_IDLE_CHECKINS", "2"))
+
+    token_tracker: TokenTracker | None = None
+    
+    try:
+        # Wait for the start event with authentication
+        start_msg = await websocket.receive_text()
+        start_data = json.loads(start_msg)
+        
+        if start_data.get("event") != "start":
+            print("❌ Expected 'start' event as first message")
+            await websocket.close(code=1008, reason="Expected start event")
+            return
+        
+        # Authenticate — accept either api_key or JWT token
+        custom_params = start_data["start"].get("customParameters", {})
+        ws_api_key = custom_params.get("api_key")
+        token = custom_params.get("token")
+        user_identity = None
+
+        if ws_api_key:
+            if ws_api_key != API_KEY:
+                print("❌ Invalid API key in WebSocket connection")
+                await websocket.close(code=1008, reason="Invalid API key")
+                return
+            user_identity = "api_client"
+            print(f"✅ WebSocket authenticated via API key")
+        elif token:
+            try:
+                user_data = verify_jwt_token(token)
+                user_identity = user_data["username"]
+                print(f"✅ WebSocket authenticated for user: {user_identity}")
+            except HTTPException as e:
+                print(f"❌ Invalid token in WebSocket: {e.detail}")
+                await websocket.close(code=1008, reason="Invalid or expired token")
+                return
+        else:
+            print("❌ No credentials provided in WebSocket connection")
+            await websocket.close(code=1008, reason="Authentication required")
+            return
+        
+        call_id = custom_params.get("call_id")
+        stream_sid = start_data["start"].get("streamSid", "browser-stream")
+
+        # Session isolation: verify call_id belongs to this identity
+        stored_identity = call_metadata.get(call_id, {}).get("auth_identity")
+        if stored_identity and stored_identity != user_identity:
+            print(f"❌ call_id {call_id} belongs to '{stored_identity}', not '{user_identity}'")
+            await websocket.send_json({
+                "event": "error",
+                "error_type": "unauthorized",
+                "message": "call_id does not belong to this session"
+            })
+            await websocket.close(code=1008)
+            return
+        meta = call_metadata.get(call_id, {})
+        
+        # Build Gemini configuration
+        instructions = meta.get("instructions", "")
+        caller = meta.get("phone", "")
+        gemini_voice = meta.get("voice", "Charon")  # Now using Gemini voice names directly
+        temperature = meta.get("temperature", 0.8)
+        
+        call_metadata.setdefault(call_id, {})
+        _init_conversation_state(call_id)
+        all_tools = function_call_tools
+
+        SYSTEM_MESSAGE = build_system_message(
+            instructions=instructions,
+            caller=caller,
+            voice=gemini_voice,
+        )
+        
+        token_tracker = TokenTracker(call_id, SYSTEM_MESSAGE, all_tools)
+
+        print(
+            f"🔧 Initializing Gemini session with voice: {gemini_voice}, temp: {temperature}, "
+            f"tools: {len(all_tools)}"
+        )
+
+        config = GeminiLiveConfig(
+            system_instruction=SYSTEM_MESSAGE,
+            tools=all_tools,
+            voice=gemini_voice,
+            temperature=temperature
+        )
+        
+        # Connect to Gemini Live API
+        gemini_client = GeminiLiveClient(config)
+        
+        # Reset audio conversion states for clean session
+        reset_audio_states()
+        
+        await gemini_client.connect()
+        session_initialized = True
+        
+        # Trigger initial greeting - send text to make agent speak first
+        print("🎤 Triggering initial greeting...")
+        await gemini_client.send_text("Start the conversation by greeting the customer warmly.")
+        
+        async def receive_from_browser():
+            """Receive audio from browser and send to Gemini."""
+            nonlocal session_initialized
+            try:
+                async for msg in websocket.iter_text():
+                    try:
+                        data = json.loads(msg)
+                        
+                        if data.get("event") == "media" and session_initialized:
+                            # Browser now sends 16kHz PCM (Gemini's native input format)
+                            payload_b64 = data["media"]["payload"]
+                            pcm_data = base64.b64decode(payload_b64)
+                            # print(f"🎙️ Received audio packet for call {call_id} (length: {len(pcm_data)} bytes)")
+                            user_pcm_buffer.write(pcm_data)
+
+                            if token_tracker:
+                                token_tracker.add_input_audio(len(pcm_data))
+
+                            # Passthrough to Gemini (16kHz -> 16kHz, no conversion needed)
+                            # This eliminates resampling overhead for lower latency
+                            pcm_16khz = convert_browser_to_gemini(pcm_data, input_rate=16000)
+
+                            await gemini_client.send_audio(pcm_16khz)
+                        
+                        elif data.get("event") == "stop":
+                            print(f"🛑 Browser sent stop event for call {call_id}")
+                            break
+                    
+                    except json.JSONDecodeError as je:
+                        print(f"⚠️ Failed to parse browser message: {je}")
+                        continue
+                    except Exception as inner_e:
+                        err_str = str(inner_e).lower()
+                        if "closed" in err_str or "1011" in err_str or not gemini_client.is_connected:
+                            print(f"🔌 Gemini connection lost, stopping browser receive loop for call {call_id}")
+                            break
+                        print(f"⚠️ Error processing browser message: {inner_e}")
+                        traceback.print_exc()
+                        continue
+                
+                print(f"🔚 Browser WebSocket stream ended normally for call {call_id}")
+                
+            except WebSocketDisconnect:
+                print(f"🔌 Browser WebSocket disconnected for call {call_id}")
+            except Exception as e:
+                print(f"❌ Unexpected error in browser receive loop: {e}")
+                traceback.print_exc()
+        
+        async def receive_from_gemini_and_forward():
+            """Receive responses from Gemini and forward to browser."""
+            nonlocal function_call_completed_time
+            nonlocal _tool_call_received_at, _tool_func_name, _tool_response_sent_at, _first_audio_after_tool, _audio_sent_before_tool, _suppress_post_tool_audio, _turn_audio_bytes, _post_tool_watchdog_task, _last_user_speech_at, _agent_is_speaking, _idle_checkin_count
+
+            async def _post_tool_audio_watchdog(func_name: str, timeout_s: float):
+                try:
+                    await asyncio.sleep(timeout_s)
+                    if _first_audio_after_tool and not _suppress_post_tool_audio:
+                        print(f"⚠️ [WATCHDOG] post-tool silence > {timeout_s}s after {func_name} — nudging Gemini")
+                        await gemini_client.send_text(
+                            "You did not produce any audio response. "
+                            "The customer is waiting. Please respond now based on the conversation so far."
+                        )
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"⚠️ [WATCHDOG] error: {e}")
+
+            def _cancel_post_tool_watchdog():
+                nonlocal _post_tool_watchdog_task
+                if _post_tool_watchdog_task and not _post_tool_watchdog_task.done():
+                    _post_tool_watchdog_task.cancel()
+                _post_tool_watchdog_task = None
+            
+            try:
+                async for response in gemini_client.receive():
+                    try:
+                        if response.type == 'audio':
+                            if function_call_completed_time is not None:
+                                function_call_completed_time = None
+
+                            if _tool_response_sent_at and _first_audio_after_tool:
+                                _first_audio_after_tool = False
+                                _cancel_post_tool_watchdog()
+                                first_audio_delay = (time.time() - _tool_response_sent_at) * 1000
+                                total_delay = (time.time() - _tool_call_received_at) * 1000
+                                print(f"⏱️ [GEMINI TIMING] {_tool_func_name} | first_audio_after_tool_response: {first_audio_delay:.0f}ms | total_tool_to_audio: {total_delay:.0f}ms")
+
+                            pcm_24khz = response.audio_data
+                            _agent_is_speaking = True
+                            agent_pcm_buffer.write(pcm_24khz)
+
+                            if token_tracker:
+                                token_tracker.add_output_audio(len(pcm_24khz))
+
+                            # Track that audio was sent in this turn (before any tool call)
+                            if not _tool_call_received_at:
+                                _audio_sent_before_tool = True
+
+                            if _suppress_post_tool_audio:
+                                continue
+
+                            _turn_audio_bytes += len(pcm_24khz)
+                            pcm_b64 = base64.b64encode(pcm_24khz).decode('utf-8')
+                            out = {
+                                "event": "media",
+                                "media": {
+                                    "payload": pcm_b64,
+                                    "format": "raw_pcm",
+                                    "sampleRate": 24000,
+                                    "channels": 1,
+                                    "bitDepth": 16
+                                }
+                            }
+                            await websocket.send_json(out)
+                        
+                        elif response.type == 'tool_call':
+                            for tool_call in response.tool_calls:
+                                func_name = tool_call.get("name")
+                                func_id = tool_call.get("id")
+                                func_args = tool_call.get("arguments", {})
+
+                                _cancel_post_tool_watchdog()
+                                _tool_call_received_at = time.time()
+                                _tool_func_name = func_name
+                                _first_audio_after_tool = True
+
+                                print(f"🔧 Function call: {func_name} with args: {func_args}")
+
+                                exec_start = time.time()
+                                try:
+                                    result = await asyncio.wait_for(
+                                        execute_function_call(func_name, func_args, call_id=call_id),
+                                        timeout=30.0
+                                    )
+                                except asyncio.TimeoutError:
+                                    print(f"⚠️ Function call {func_name} timed out after 30 seconds")
+                                    result = {
+                                        "success": False,
+                                        "error": "timeout",
+                                        "message": f"The operation timed out. Please try again."
+                                    }
+                                exec_ms = (time.time() - exec_start) * 1000
+                                
+                                print(f"✅ Function result: {result}")
+
+                                if token_tracker:
+                                    token_tracker.add_tool_call(func_name, func_args, result)
+
+                                send_start = time.time()
+                                await gemini_client.send_tool_response([{
+                                    "id": func_id,
+                                    "name": func_name,
+                                    "response": result
+                                }])
+                                _tool_response_sent_at = time.time()
+                                send_ms = (_tool_response_sent_at - send_start) * 1000
+                                
+                                function_call_completed_time = _tool_response_sent_at
+                                print(f"⏱️ [GEMINI TIMING] {func_name} | exec: {exec_ms:.0f}ms | send_tool_response: {send_ms:.0f}ms | waiting for audio...")
+
+                                _post_tool_watchdog_task = asyncio.create_task(
+                                    _post_tool_audio_watchdog(func_name, POST_TOOL_AUDIO_TIMEOUT_SECONDS)
+                                )
+                                
+                                outgoing_func_result = {
+                                    "event": "function_result",
+                                    "name": func_name,
+                                    "arguments": json.dumps(func_args),
+                                    "result": result
+                                }
+                                await websocket.send_json(outgoing_func_result)
+                        
+                        elif response.type == 'interrupted':
+                            current_time = time.time()
+                            if function_call_completed_time is not None:
+                                time_since_function_call = current_time - function_call_completed_time
+                                if time_since_function_call < FUNCTION_CALL_GRACE_PERIOD:
+                                    print(f"⚠️ Ignoring interruption {time_since_function_call:.2f}s after function call")
+                                    continue
+
+                            await websocket.send_json({"event": "clear"})
+                        
+                        elif response.type == 'turn_complete':
+                            _cancel_post_tool_watchdog()
+                            _agent_is_speaking = False
+                            _last_user_speech_at = time.time()
+                            if _tool_call_received_at:
+                                turn_total = (time.time() - _tool_call_received_at) * 1000
+                                print(f"⏱️ [GEMINI TIMING] {_tool_func_name} | turn_complete total: {turn_total:.0f}ms")
+                                _tool_call_received_at = None
+                                _tool_response_sent_at = None
+                            print(f"📋 Gemini turn complete")
+                            if function_call_completed_time is not None:
+                                print(f"✅ Response completed, clearing function call flag")
+                                function_call_completed_time = None
+
+                            # Detect empty/silent turns and nudge Gemini to retry.
+                            if _turn_audio_bytes == 0 and not _suppress_post_tool_audio:
+                                print(f"⚠️ Empty audio turn detected — nudging Gemini to respond")
+                                await gemini_client.send_text(
+                                    "You did not produce any audio response. "
+                                    "The customer is waiting. Please respond now based on the conversation so far."
+                                )
+
+                            _audio_sent_before_tool = False
+                            _suppress_post_tool_audio = False
+                            _turn_audio_bytes = 0
+
+                            if token_tracker:
+                                token_tracker.finalize_turn()
+
+                        elif response.type == 'input_transcription':
+                            print(f"🎤 User said: {response.transcription}")
+                            if response.transcription and response.transcription.strip():
+                                _last_user_speech_at = time.time()
+                                _idle_checkin_count = 0
+                                if call_id and call_id in call_metadata:
+                                    meta = call_metadata[call_id]
+                                    prev = meta.get("_current_user_turn_text", "")
+                                    meta["_current_user_turn_text"] = (prev + " " + response.transcription).strip()
+                            if token_tracker and response.transcription:
+                                token_tracker.set_input_transcription(response.transcription)
+
+                        elif response.type == 'output_transcription':
+                            print(f"🔊 Agent said: {response.transcription}")
+                            if token_tracker and response.transcription:
+                                token_tracker.set_output_transcription(response.transcription)
+                        
+                        elif response.type == 'tool_call_cancelled':
+                            print(f"⚠️ Tool calls cancelled")
+                            _tool_call_received_at = None
+                            _tool_response_sent_at = None
+                            continue
+
+                        elif response.type == 'usage_metadata' and response.usage_metadata:
+                            meta = response.usage_metadata
+                            total = meta.get("total_token_count")
+                            details = meta.get("response_tokens_details", [])
+                            detail_str = ", ".join(
+                                f"{d['modality']}: {d['token_count']}" for d in details
+                            ) if details else ""
+                            print(f"🔢 [GEMINI TOKENS] call={call_id} total={total}{' | ' + detail_str if detail_str else ''}")
+
+                    except Exception as inner_e:
+                        print(f"⚠️ Error processing Gemini message: {inner_e}")
+                        traceback.print_exc()
+                        continue
+            
+            except Exception as e:
+                print(f"❌ Unexpected error in Gemini receive loop: {e}")
+                traceback.print_exc()
+                try:
+                    await websocket.send_json({
+                        "event": "error",
+                        "message": "An unexpected error occurred. Please try again."
+                    })
+                except:
+                    pass
+        
+        async def user_idle_watchdog():
+            """If the customer goes quiet for too long (and the agent isn't speaking),
+            nudge Gemini to check on the customer in their current language."""
+            nonlocal _last_user_speech_at, _idle_checkin_count
+            try:
+                while True:
+                    await asyncio.sleep(2.0)
+                    if _agent_is_speaking:
+                        continue
+                    if _idle_checkin_count >= MAX_IDLE_CHECKINS:
+                        continue
+                    idle_for = time.time() - _last_user_speech_at
+                    if idle_for < USER_IDLE_TIMEOUT_SECONDS:
+                        continue
+                    _idle_checkin_count += 1
+                    print(f"⚠️ [IDLE WATCHDOG] customer silent for {idle_for:.1f}s — nudging check-in #{_idle_checkin_count}")
+                    if _idle_checkin_count < MAX_IDLE_CHECKINS:
+                        nudge = (
+                            "The customer has been silent for a while. "
+                            "Politely check if they are still on the line, IN THEIR CURRENT LANGUAGE "
+                            "(Urdu: 'Hello, kya aap line par hain?' / English: 'Hello, are you still there?'). "
+                            "Keep it short and warm. Do not repeat your previous answer."
+                        )
+                    else:
+                        nudge = (
+                            "The customer has remained silent despite a prior check-in. "
+                            "Politely inform them you will end the call if there is no response, "
+                            "IN THEIR CURRENT LANGUAGE, then wait. Keep it brief and warm."
+                        )
+                    try:
+                        await gemini_client.send_text(nudge)
+                    except Exception as e:
+                        print(f"⚠️ [IDLE WATCHDOG] send_text failed: {e}")
+                    _last_user_speech_at = time.time()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"⚠️ [IDLE WATCHDOG] error: {e}")
+
+        # Run tasks concurrently
+        recv_task = asyncio.create_task(receive_from_browser())
+        send_task = asyncio.create_task(receive_from_gemini_and_forward())
+        idle_task = asyncio.create_task(user_idle_watchdog())
+
+        try:
+            done, pending = await asyncio.wait(
+                [recv_task, send_task, idle_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in done:
+                if task == recv_task:
+                    print(f"🔚 Browser receive task completed for call {call_id}")
+                elif task == send_task:
+                    print(f"🔚 Gemini send task completed for call {call_id}")
+
+                if task.exception():
+                    print(f"❌ Task exception: {task.exception()}")
+            
+            for task in pending:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        
+        except Exception as e:
+            print(f"❌ Error in main task loop: {e}")
+            traceback.print_exc()
+    
+    except Exception as e:
+        print(f"❌ Error during WebSocket setup: {e}")
+        traceback.print_exc()
+    
+    finally:
+        if cleanup_done:
+            return
+        cleanup_done = True
+
+        # Close Gemini connection
+        if gemini_client:
+            await gemini_client.close()
+
+        # Save recordings
+        if call_id:
+            print(f"💾 Saving recordings for call {call_id}...")
+
+            user_file_path = str(USER_AUDIO_DIR / f"{call_id}_user.wav")
+            agent_file_path = str(AGENT_AUDIO_DIR / f"{call_id}_agent.wav")
+
+            def save_wav_file(path: str, pcm_data: bytes, sample_rate: int = 8000):
+                with wave.open(path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm_data)
+
+            # User audio at 16kHz (browser mic rate), agent at 24kHz (Gemini output rate)
+            save_wav_file(user_file_path, user_pcm_buffer.getvalue(), sample_rate=16000)
+            save_wav_file(agent_file_path, agent_pcm_buffer.getvalue(), sample_rate=24000)
+
+            print(f"✅ Saved user audio: {user_file_path}")
+            print(f"✅ Saved agent audio: {agent_file_path}")
+
+            try:
+                user_transcript = await transcribe_audio(user_file_path)
+            except Exception as e:
+                print(f"⚠️ Could not transcribe user audio: {e}")
+                user_transcript = ""
+
+            try:
+                agent_transcript = await transcribe_audio(agent_file_path)
+            except Exception as e:
+                print(f"⚠️ Could not transcribe agent audio: {e}")
+                agent_transcript = ""
+
+            token_summary = token_tracker.get_summary() if token_tracker else {}
+            if token_summary:
+                ts = token_summary
+                print(
+                    f"🔢 [TOKENS] call={call_id} FINAL SUMMARY\n"
+                    f"   turns: {ts['total_turns']} | base: ~{ts['base_tokens']} "
+                    f"(prompt: ~{ts['system_prompt_tokens']}, tools: ~{ts['tools_tokens']})\n"
+                    f"   input: ~{ts['total_input_tokens']} | output: ~{ts['total_output_tokens']} "
+                    f"| tools: ~{ts['total_tool_tokens']}\n"
+                    f"   total: ~{ts['total_tokens']} / {ts['context_window']} "
+                    f"({ts['utilization_pct']}% utilization)"
+                )
+
+            call_meta_snapshot = call_metadata.get(call_id, {})
+            transcripts_output = {
+                "call_id": call_id,
+                "user_transcript": user_transcript,
+                "agent_transcript": agent_transcript,
+                "conversation_summary": call_meta_snapshot.get("conversation_summary", ""),
+                "topics_discussed": call_meta_snapshot.get("conversation_memory", []),
+                "pending_questions": call_meta_snapshot.get("question_queue", []),
+                "answered_questions": call_meta_snapshot.get("answered_questions", []),
+                "token_usage": token_summary,
+            }
+
+            print(f"📝 Transcripts saved for call {call_id}")
+
+            analysis_result = await analyze_call_with_llm(call_id, user_transcript, agent_transcript)
+            print(f"📊 Call analysis complete: {analysis_result}")
+
+            with open(RECORDINGS_DIR / f"{call_id}_transcript.json", "w", encoding="utf-8") as f:
+                json.dump(transcripts_output, f, ensure_ascii=False, indent=2)
+
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
+
+@app.get("/call-analysis/{call_id}")
+async def get_call_analysis(call_id: str, request: Request):
+    user_data = authenticate_request(request)
+    
+    analysis_file_path = RECORDINGS_DIR / "analysis" / f"{call_id}_analysis.json"
+
+    if not analysis_file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Analysis not found for call_id: {call_id}")
+    
+    try:
+        with open(analysis_file_path, "r", encoding="utf-8") as f:
+            analysis_data = json.load(f)
+        return analysis_data
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Error reading analysis file")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving analysis: {str(e)}")
+
+
+@app.get("/call-analysis/{call_id}/download")
+async def download_call_analysis(call_id: str, request: Request):
+    authenticate_request(request)
+    analysis_file_path = RECORDINGS_DIR / "analysis" / f"{call_id}_analysis.json"
+    if not analysis_file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Analysis not found for call_id: {call_id}")
+    return FileResponse(
+        str(analysis_file_path),
+        media_type="application/json",
+        filename=f"{call_id}_analysis.json",
+    )
+
+
+@app.get("/call-transcript/{call_id}/download")
+async def download_call_transcript(call_id: str, request: Request):
+    authenticate_request(request)
+    transcript_path = RECORDINGS_DIR / f"{call_id}_transcript.json"
+    if not transcript_path.exists():
+        raise HTTPException(status_code=404, detail=f"Transcript not found for call_id: {call_id}")
+    return FileResponse(
+        str(transcript_path),
+        media_type="application/json",
+        filename=f"{call_id}_transcript.json",
+    )
+
+
+@app.get("/available-voices")
+async def get_available_voices(request: Request):
+    user_data = authenticate_request(request)
+    
+    return {
+        "voices": AVAILABLE_VOICES
+    }
+
+
+def create_jwt_token(username: str, full_name: str) -> str:
+    now = dt.now(timezone.utc)
+    payload = {
+        "username": username,
+        "full_name": full_name,
+        "exp": now + timedelta(hours=JWT_EXPIRATION_HOURS),
+        "iat": now
+    }
+    token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return token
+
+
+def verify_jwt_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_token_from_request(request: Request) -> str:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+    return auth_header.replace("Bearer ", "")
+
+
+def authenticate_request(request: Request) -> dict:
+    """Authenticate via X-API-Key header/query param OR JWT Bearer token.
+    Returns a user identity dict on success, raises HTTPException(401) on failure."""
+    # Try API key first (header or query param)
+    api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+    if api_key:
+        if api_key == API_KEY:
+            return {"username": "api_client", "full_name": "API Client", "auth_method": "api_key"}
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    # Fall back to JWT Bearer token
+    token = get_token_from_request(request)
+    user_data = verify_jwt_token(token)
+    user_data["auth_method"] = "jwt"
+    return user_data
+
+
+@app.post("/auth/login")
+async def login(credentials: dict = Body(...)):
+    username = credentials.get("username", "").strip()
+    password = credentials.get("password", "")
+    
+    if username in USERS_DB:
+        user = USERS_DB[username]
+        if user["password"] == password:
+            token = create_jwt_token(username, user["full_name"])
+            
+            return {
+                "success": True,
+                "message": "Login successful",
+                "token": token,
+                "user": {
+                    "username": username,
+                    "full_name": user["full_name"]
+                }
+            }
+    
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=PORT)
