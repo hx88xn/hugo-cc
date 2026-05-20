@@ -431,15 +431,9 @@ AVAILABLE_VOICES = {
 async def start_browser_call(request: Request, payload: dict = Body(...)):
     user_data = authenticate_request(request)
 
-    session_id = payload.get("sessionId")
-    interaction_id = payload.get("interactionId")
-    reference_id = payload.get("referenceId")
-
-    if not session_id or not interaction_id or not reference_id:
-        raise HTTPException(
-            status_code=400,
-            detail="sessionId, interactionId, and referenceId are required",
-        )
+    session_id = payload.get("sessionId") or str(uuid.uuid4())
+    interaction_id = payload.get("interactionId") or str(uuid.uuid4())
+    reference_id = payload.get("referenceId") or str(uuid.uuid4())
 
     try:
         session_id = str(uuid.UUID(str(session_id)))
