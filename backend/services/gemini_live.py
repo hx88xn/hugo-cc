@@ -26,20 +26,22 @@ GEMINI_RECEIVE_SAMPLE_RATE = 24000  # Output audio sample rate
 # All available Gemini Live API voices (30 HD voices)
 # Keys are Gemini API voice names, 'name' is human-friendly display name
 GEMINI_VOICES = {
-    # Original Live API voices
+    # Curated subset of Gemini Live HD voices, verified for clear gender perception.
+    # Note: Gemini's "Kore" is labeled female but sounds androgynous/masculine in Live API,
+    # so Ayesha is mapped to "Leda" (youthful female) instead.
     'Puck': {'name': 'Omar', 'gender': 'Male', 'description': 'Conversational, friendly, and upbeat'},
     'Charon': {'name': 'Saad', 'gender': 'Male', 'description': 'Deep, informative, and authoritative'},
-    'Kore': {'name': 'Ayesha', 'gender': 'Female', 'description': 'Energetic, youthful, and professional'},
+    'Leda': {'name': 'Ayesha', 'gender': 'Female', 'description': 'Energetic, youthful, and professional'},
     'Fenrir': {'name': 'Ahmed', 'gender': 'Male', 'description': 'Warm, approachable, and friendly'},
     'Aoede': {'name': 'Sara', 'gender': 'Female', 'description': 'Clear, conversational, and thoughtful'},
-    
+    'Sulafat': {'name': 'Hina', 'gender': 'Female', 'description': 'Warm, mature, and reassuring'},
 }
 
 # Map OpenAI voices to Gemini voices
 OPENAI_TO_GEMINI_VOICE_MAP = {
     'echo': 'Charon',      # Male, calm and informative
     'alloy': 'Puck',       # Male, upbeat and conversational
-    'shimmer': 'Kore',     # Female, energetic and youthful
+    'shimmer': 'Leda',     # Female, energetic and youthful
     'ash': 'Fenrir',       # Male, warm and friendly
     'coral': 'Aoede',      # Female, clear and thoughtful
     'sage': 'Aoede',       # Female, thoughtful
