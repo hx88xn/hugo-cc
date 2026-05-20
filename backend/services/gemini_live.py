@@ -228,7 +228,7 @@ class GeminiLiveClient:
         vad_settings = {
             "disabled": False,
             "start_of_speech_sensitivity": types.StartSensitivity.START_SENSITIVITY_HIGH,
-            "end_of_speech_sensitivity": types.EndSensitivity.END_SENSITIVITY_HIGH,
+            "end_of_speech_sensitivity": types.EndSensitivity.END_SENSITIVITY_LOW,
             "prefix_padding_ms": 300,
             "silence_duration_ms": 600,
         }
